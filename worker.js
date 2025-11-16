@@ -9,7 +9,6 @@ let MESSAGE_INTERVAL = 1
 let DELETE_TOPIC_AS_BAN = false
 let ENABLE_VERIFICATION = false
 let VERIFICATION_MAX_ATTEMPTS = 10
-let TARGET_FORWARD_ID = '' // 新增：目标转发ID
 
 // 初始化配置变量
 function initConfig(env) {
@@ -22,8 +21,6 @@ function initConfig(env) {
   DELETE_TOPIC_AS_BAN = (env.ENV_DELETE_TOPIC_AS_BAN || '').toLowerCase() === 'true'
   ENABLE_VERIFICATION = (env.ENV_ENABLE_VERIFICATION || '').toLowerCase() === 'true'
   VERIFICATION_MAX_ATTEMPTS = env.ENV_VERIFICATION_MAX_ATTEMPTS ? parseInt(env.ENV_VERIFICATION_MAX_ATTEMPTS) || 10 : 10
-  // 新增：初始化转发目标ID
-  TARGET_FORWARD_ID = env.ENV_TARGET_FORWARD_ID || ''
 }
 
 /**
@@ -107,11 +104,6 @@ function sendPhoto(msg = {}) {
   return requestTelegram('sendPhoto', makeReqBody(msg))
 }
 
-// 新增：转发消息函数
-function forwardMessage(msg = {}) {
-  return requestTelegram('forwardMessage', makeReqBody(msg))
-}
-
 /**
  * 验证码缓存管理（使用 Cache API）
  */
@@ -189,6 +181,18 @@ class Database {
     this.d1 = d1
   }
 
+  // 安全执行SQL的方法，处理可能的undefined结果
+  async safeRun(query, params = []) {
+    try {
+      const result = await this.d1.prepare(query).bind(...params).run()
+      // 处理可能的undefined结果，确保返回对象
+      return result || { success: true }
+    } catch (error) {
+      console.error('Database error:', error)
+      throw error
+    }
+  }
+
   // 用户相关
   async getUser(user_id) {
     const result = await this.d1.prepare(
@@ -209,26 +213,27 @@ class Database {
   }
 
   async setUser(user_id, userData) {
-    await this.d1.prepare(
+    return this.safeRun(
       `INSERT OR REPLACE INTO users 
        (user_id, first_name, last_name, username, message_thread_id, created_at, updated_at) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      user_id.toString(),
-      userData.first_name || null,
-      userData.last_name || null,
-      userData.username || null,
-      userData.message_thread_id || null,
-      userData.created_at || Date.now(),
-      userData.updated_at || Date.now()
-    ).run()
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        user_id.toString(),
+        userData.first_name || null,
+        userData.last_name || null,
+        userData.username || null,
+        userData.message_thread_id || null,
+        userData.created_at || Date.now(),
+        userData.updated_at || Date.now()
+      ]
+    )
   }
 
   async getAllUsers() {
     const result = await this.d1.prepare(
       'SELECT * FROM users'
     ).all()
-    return result.results || []
+    return result?.results || []
   }
 
   // 消息映射相关
@@ -240,9 +245,10 @@ class Database {
   }
 
   async setMessageMap(key, value) {
-    await this.d1.prepare(
-      'INSERT OR REPLACE INTO message_mappings (mapping_key, mapped_value, created_at) VALUES (?, ?, ?)'
-    ).bind(key, value || null, Date.now()).run()
+    return this.safeRun(
+      'INSERT OR REPLACE INTO message_mappings (mapping_key, mapped_value, created_at) VALUES (?, ?, ?)',
+      [key, value || null, Date.now()]
+    )
   }
 
   // 话题状态相关
@@ -254,9 +260,10 @@ class Database {
   }
 
   async setTopicStatus(thread_id, status) {
-    await this.d1.prepare(
-      'INSERT OR REPLACE INTO topic_status (thread_id, status, updated_at) VALUES (?, ?, ?)'
-    ).bind(thread_id || null, status || 'opened', Date.now()).run()
+    return this.safeRun(
+      'INSERT OR REPLACE INTO topic_status (thread_id, status, updated_at) VALUES (?, ?, ?)',
+      [thread_id || null, status || 'opened', Date.now()]
+    )
   }
 
   // 用户状态相关（非验证码）
@@ -278,15 +285,17 @@ class Database {
 
   async setUserState(user_id, key, value, expirationTtl = null) {
     const expiryTime = expirationTtl ? Date.now() + (expirationTtl * 1000) : null
-    await this.d1.prepare(
-      'INSERT OR REPLACE INTO user_states (user_id, state_key, state_value, expiry_time) VALUES (?, ?, ?, ?)'
-    ).bind(user_id.toString(), key || 'unknown', JSON.stringify(value), expiryTime).run()
+    return this.safeRun(
+      'INSERT OR REPLACE INTO user_states (user_id, state_key, state_value, expiry_time) VALUES (?, ?, ?, ?)',
+      [user_id.toString(), key || 'unknown', JSON.stringify(value), expiryTime]
+    )
   }
 
   async deleteUserState(user_id, key) {
-    await this.d1.prepare(
-      'DELETE FROM user_states WHERE user_id = ? AND state_key = ?'
-    ).bind(user_id.toString(), key).run()
+    return this.safeRun(
+      'DELETE FROM user_states WHERE user_id = ? AND state_key = ?',
+      [user_id.toString(), key]
+    )
   }
 
   // 屏蔽用户相关
@@ -299,13 +308,15 @@ class Database {
 
   async blockUser(user_id, blocked = true) {
     if (blocked) {
-      await this.d1.prepare(
-        'INSERT OR REPLACE INTO blocked_users (user_id, blocked, blocked_at) VALUES (?, ?, ?)'
-      ).bind(user_id.toString(), 1, Date.now()).run()
+      return this.safeRun(
+        'INSERT OR REPLACE INTO blocked_users (user_id, blocked, blocked_at) VALUES (?, ?, ?)',
+        [user_id.toString(), 1, Date.now()]
+      )
     } else {
-      await this.d1.prepare(
-        'DELETE FROM blocked_users WHERE user_id = ?'
-      ).bind(user_id.toString()).run()
+      return this.safeRun(
+        'DELETE FROM blocked_users WHERE user_id = ?',
+        [user_id.toString()]
+      )
     }
   }
 
@@ -318,58 +329,91 @@ class Database {
   }
 
   async setLastMessageTime(user_id, timestamp) {
-    await this.d1.prepare(
-      'INSERT OR REPLACE INTO message_rates (user_id, last_message_time) VALUES (?, ?)'
-    ).bind(user_id.toString(), timestamp || Date.now()).run()
+    return this.safeRun(
+      'INSERT OR REPLACE INTO message_rates (user_id, last_message_time) VALUES (?, ?)',
+      [user_id.toString(), timestamp || Date.now()]
+    )
   }
 
   // 清理过期数据（定期调用）
   async cleanupExpiredStates() {
     const now = Date.now()
-    await this.d1.prepare(
-      'DELETE FROM user_states WHERE expiry_time IS NOT NULL AND expiry_time < ?'
-    ).bind(now).run()
+    return this.safeRun(
+      'DELETE FROM user_states WHERE expiry_time IS NOT NULL AND expiry_time < ?',
+      [now]
+    )
   }
 
   // 删除用户的所有消息映射
   async deleteUserMessageMappings(user_id) {
-    await this.d1.prepare(
-      'DELETE FROM message_mappings WHERE mapping_key LIKE ?'
-    ).bind(`u2a:${user_id}:%`).run()
+    return this.safeRun(
+      'DELETE FROM message_mappings WHERE mapping_key LIKE ?',
+      [`u2a:${user_id}:%`]
+    )
   }
 
-  // 新增：源频道管理相关
-  async getSourceChannels() {
-    const result = await this.d1.prepare(
-      'SELECT * FROM source_channels'
-    ).all()
-    return result.results || []
-  }
+  // 初始化数据库表结构
+  async initTables() {
+    // 创建用户表
+    await this.safeRun(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        username TEXT,
+        message_thread_id INTEGER,
+        created_at INTEGER,
+        updated_at INTEGER
+      )
+    `);
 
-  async addSourceChannel(channelId, username, link) {
-    await this.d1.prepare(
-      `INSERT OR IGNORE INTO source_channels 
-       (channel_id, username, link, added_at) 
-       VALUES (?, ?, ?, ?)`
-    ).bind(
-      channelId,
-      username,
-      link,
-      Date.now()
-    ).run()
-  }
+    // 创建消息映射表
+    await this.safeRun(`
+      CREATE TABLE IF NOT EXISTS message_mappings (
+        mapping_key TEXT PRIMARY KEY,
+        mapped_value TEXT,
+        created_at INTEGER
+      )
+    `);
 
-  async removeSourceChannel(channelId) {
-    await this.d1.prepare(
-      'DELETE FROM source_channels WHERE channel_id = ?'
-    ).bind(channelId).run()
-  }
+    // 创建话题状态表
+    await this.safeRun(`
+      CREATE TABLE IF NOT EXISTS topic_status (
+        thread_id INTEGER PRIMARY KEY,
+        status TEXT,
+        updated_at INTEGER
+      )
+    `);
 
-  async isSourceChannel(channelId) {
-    const result = await this.d1.prepare(
-      'SELECT id FROM source_channels WHERE channel_id = ?'
-    ).bind(channelId).first()
-    return !!result
+    // 创建用户状态表
+    await this.safeRun(`
+      CREATE TABLE IF NOT EXISTS user_states (
+        user_id TEXT,
+        state_key TEXT,
+        state_value TEXT,
+        expiry_time INTEGER,
+        PRIMARY KEY (user_id, state_key)
+      )
+    `);
+
+    // 创建封禁用户表
+    await this.safeRun(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        user_id TEXT PRIMARY KEY,
+        blocked INTEGER,
+        blocked_at INTEGER
+      )
+    `);
+
+    // 创建消息频率限制表
+    await this.safeRun(`
+      CREATE TABLE IF NOT EXISTS message_rates (
+        user_id TEXT PRIMARY KEY,
+        last_message_time INTEGER
+      )
+    `);
+
+    return true;
   }
 }
 
@@ -400,283 +444,96 @@ function randomString(length = 6) {
   return result
 }
 
-// 新增：解析频道ID工具函数
-async function resolveChannelId(input) {
-  try {
-    let username;
-    if (input.startsWith('http')) {
-      username = new URL(input).pathname.replace('/', '');
-    } else if (input.startsWith('@')) {
-      username = input.slice(1);
-    } else {
-      username = input;
-    }
-
-    const response = await fetch(apiUrl('getChat', { chat_id: `@${username}` }));
-    const data = await response.json();
-    return data.ok ? data.result.id.toString() : null;
-  } catch (error) {
-    console.error("Channel resolution error:", error);
-    return null;
-  }
-}
-
-// 新增：转发频道消息处理函数
-async function handleChannelPost(message) {
-  if (!TARGET_FORWARD_ID) return;
-  
-  const sourceChannelId = message.chat.id.toString();
-  if (!await db.isSourceChannel(sourceChannelId)) return;
-
-  try {
-    await forwardMessage({
-      chat_id: TARGET_FORWARD_ID,
-      from_chat_id: sourceChannelId,
-      message_id: message.message_id
-    });
-    console.log(`Forwarded message from ${sourceChannelId} to ${TARGET_FORWARD_ID}`);
-  } catch (error) {
-    console.error("Forward error:", error);
-  }
-}
-
-// 新增：管理员命令处理函数
-async function handleAdminCommands(message) {
-  const text = message.text || '';
-  const chatId = message.chat.id;
-  const userId = message.from.id.toString();
-
-  // 仅允许管理员操作
-  if (userId !== ADMIN_UID) return;
-
-  // 添加源频道
-  if (text.startsWith('/addsource')) {
-    const input = text.split(' ')[1];
-    if (!input) {
-      return sendMessage({ chat_id: chatId, text: '请提供频道链接或用户名（如 /addsource @example）' });
-    }
-
-    const channelId = await resolveChannelId(input);
-    if (!channelId) {
-      return sendMessage({ chat_id: chatId, text: '解析频道失败，请确保机器人已加入该频道' });
-    }
-
-    await db.addSourceChannel(
-      channelId,
-      input.startsWith('@') ? input : null,
-      input.startsWith('http') ? input : null
-    );
-
-    return sendMessage({ chat_id: chatId, text: `已添加源频道（ID: ${channelId}）` });
-  }
-
-  // 删除源频道
-  if (text.startsWith('/removesource')) {
-    const input = text.split(' ')[1];
-    if (!input) {
-      return sendMessage({ chat_id: chatId, text: '请提供频道链接或用户名（如 /removesource @example）' });
-    }
-
-    const channelId = await resolveChannelId(input);
-    if (!channelId) {
-      return sendMessage({ chat_id: chatId, text: '解析频道失败' });
-    }
-
-    await db.removeSourceChannel(channelId);
-    return sendMessage({ chat_id: chatId, text: `已删除源频道（ID: ${channelId}）` });
-  }
-
-  // 列出源频道
-  if (text.startsWith('/listsources')) {
-    const channels = await db.getSourceChannels();
-    if (channels.length === 0) {
-      return sendMessage({ chat_id: chatId, text: '当前没有配置源频道' });
-    }
-
-    let messageText = '当前源频道列表：\n';
-    channels.forEach(channel => {
-      messageText += `- ID: ${channel.channel_id}\n`;
-      if (channel.username) messageText += `  用户名: ${channel.username}\n`;
-      if (channel.link) messageText += `  链接: ${channel.link}\n`;
-    });
-
-    return sendMessage({ chat_id: chatId, text: messageText });
-  }
-}
-
-// 新增：数据库初始化函数
-async function initDatabase(request, env) {
-  try {
-    // 初始化用户表（如果不存在）
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        first_name TEXT,
-        last_name TEXT,
-        username TEXT,
-        message_thread_id INTEGER,
-        created_at INTEGER,
-        updated_at INTEGER
-      )
-    `).run();
-
-    // 初始化消息映射表
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS message_mappings (
-        mapping_key TEXT PRIMARY KEY,
-        mapped_value TEXT,
-        created_at INTEGER
-      )
-    `).run();
-
-    // 初始化话题状态表
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS topic_status (
-        thread_id INTEGER PRIMARY KEY,
-        status TEXT,
-        updated_at INTEGER
-      )
-    `).run();
-
-    // 初始化用户状态表
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS user_states (
-        user_id TEXT,
-        state_key TEXT,
-        state_value TEXT,
-        expiry_time INTEGER,
-        PRIMARY KEY (user_id, state_key)
-      )
-    `).run();
-
-    // 初始化屏蔽用户表
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS blocked_users (
-        user_id TEXT PRIMARY KEY,
-        blocked INTEGER,
-        blocked_at INTEGER
-      )
-    `).run();
-
-    // 初始化消息频率表
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS message_rates (
-        user_id TEXT PRIMARY KEY,
-        last_message_time INTEGER
-      )
-    `).run();
-
-    // 新增：初始化源频道表
-    await env.D1.prepare(`
-      CREATE TABLE IF NOT EXISTS source_channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id TEXT NOT NULL,
-        username TEXT,
-        link TEXT,
-        added_at INTEGER,
-        UNIQUE(channel_id)
-      )
-    `).run();
-
-    // 从环境变量导入默认频道
-    if (env.ENV_DEFAULT_SOURCE_CHANNELS) {
-      const channels = env.ENV_DEFAULT_SOURCE_CHANNELS.split(',').map(c => c.trim());
-      for (const channel of channels) {
-        const channelId = await resolveChannelId(channel);
-        if (channelId) {
-          await env.D1.prepare(`
-            INSERT OR IGNORE INTO source_channels (channel_id, username, link, added_at)
-            VALUES (?, ?, ?, ?)
-          `).bind(
-            channelId,
-            channel.startsWith('@') ? channel : null,
-            channel.startsWith('http') ? channel : null,
-            Date.now()
-          ).run();
-        }
-      }
-    }
-
-    return new Response("✅ 数据库表初始化成功");
-  } catch (error) {
-    console.error("数据库初始化错误:", error);
-    return new Response("❌ 数据库初始化失败", { status: 500 });
-  }
-}
-
-// 新增：注册Webhook函数
-async function registerWebhook(env) {
-  const webhookUrl = new URL(request.url).origin + WEBHOOK;
-  const response = await requestTelegram('setWebhook', null, {
-    url: webhookUrl,
-    secret_token: SECRET
-  });
-  return new Response(JSON.stringify(response), {
-    headers: { 'Content-Type': 'application/json' }
-  });
-}
-
-// 新增：更新处理函数
-async function onUpdate(update, env) {
-  try {
-    db = new Database(env.D1);
-    
-    // 处理频道消息
-    if (update.channel_post) {
-      await handleChannelPost(update.channel_post);
-      return;
-    }
-
-    // 处理编辑的频道消息
-    if (update.edited_channel_post) {
-      await handleChannelPost(update.edited_channel_post);
-      return;
-    }
-
-    // 处理普通消息
-    const message = update.message;
-    if (message) {
-      // 处理管理员命令
-      if (message.text && message.text.startsWith('/')) {
-        await handleAdminCommands(message);
-      }
-      // 这里可以添加原有消息处理逻辑
-    }
-  } catch (error) {
-    console.error('更新处理错误:', error);
-  }
-}
-
-// 主入口函数
+/**
+ * 主处理函数
+ */
 export default {
-  async fetch(request, env) {
-    initConfig(env);
-    db = new Database(env.D1);
-
-    const url = new URL(request.url);
+  async fetch(request, env, ctx) {
+    initConfig(env)
+    db = new Database(env.D1)
+    
+    const url = new URL(request.url)
     
     // 数据库初始化端点
     if (url.pathname === '/initDatabase') {
-      return initDatabase(request, env);
+      try {
+        await db.initTables()
+        return new Response('✅ Database tables initialized successfully', {
+          headers: { 'Content-Type': 'text/plain' }
+        })
+      } catch (error) {
+        console.error('Database initialization error:', error)
+        return new Response(`❌ 数据库初始化失败: ${error.message}`, {
+          status: 500,
+          headers: { 'Content-Type': 'text/plain' }
+        })
+      }
     }
     
     // Webhook注册端点
     if (url.pathname === '/registerWebhook') {
-      return registerWebhook(env);
-    }
-
-    // 处理Telegram回调
-    if (request.method === 'POST' && url.pathname === WEBHOOK) {
-      // 验证secret
-      if (SECRET && request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
-        return new Response('Unauthorized', { status: 403 });
+      try {
+        const webhookUrl = `${url.origin}${WEBHOOK}?secret=${SECRET}`
+        const response = await requestTelegram('setWebhook', null, {
+          url: webhookUrl,
+          secret_token: SECRET
+        })
+        return new Response(JSON.stringify(response), {
+          headers: { 'Content-Type': 'application/json' }
+        })
+      } catch (error) {
+        return new Response(`❌ Webhook注册失败: ${error.message}`, {
+          status: 500,
+          headers: { 'Content-Type': 'text/plain' }
+        })
       }
-
-      const update = await request.json();
-      await onUpdate(update, env);
-      return new Response('OK');
     }
-
-    return new Response('Not found', { status: 404 });
+    
+    // Telegram Webhook处理端点
+    if (url.pathname === WEBHOOK && url.searchParams.get('secret') === SECRET) {
+      try {
+        const update = await request.json()
+        await handleUpdate(update)
+        return new Response('OK')
+      } catch (error) {
+        console.error('Webhook handling error:', error)
+        return new Response('Error', { status: 500 })
+      }
+    }
+    
+    return new Response('Not found', { status: 404 })
   }
-};
+}
+
+/**
+ * 处理Telegram更新
+ */
+async function handleUpdate(update) {
+  // 这里是消息处理逻辑，根据需要实现
+  if (update.message) {
+    await handleMessage(update.message)
+  }
+  // 可以添加其他类型更新的处理逻辑
+}
+
+/**
+ * 处理消息
+ */
+async function handleMessage(message) {
+  // 消息处理具体实现
+  const chatId = message.chat.id
+  const userId = message.from.id
+  
+  // 检查用户是否被封禁
+  if (await db.isUserBlocked(userId)) {
+    return
+  }
+  
+  // 简单的欢迎消息示例
+  if (message.text === '/start') {
+    await sendMessage({
+      chat_id: chatId,
+      text: WELCOME_MESSAGE
+    })
+  }
+}
