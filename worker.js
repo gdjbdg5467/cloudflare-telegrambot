@@ -9,6 +9,7 @@ let MESSAGE_INTERVAL = 1
 let DELETE_TOPIC_AS_BAN = false
 let ENABLE_VERIFICATION = false
 let VERIFICATION_MAX_ATTEMPTS = 10
+let TARGET_FORWARD_ID = '' // 新增：目标转发ID
 
 // 初始化配置变量
 function initConfig(env) {
@@ -21,6 +22,8 @@ function initConfig(env) {
   DELETE_TOPIC_AS_BAN = (env.ENV_DELETE_TOPIC_AS_BAN || '').toLowerCase() === 'true'
   ENABLE_VERIFICATION = (env.ENV_ENABLE_VERIFICATION || '').toLowerCase() === 'true'
   VERIFICATION_MAX_ATTEMPTS = env.ENV_VERIFICATION_MAX_ATTEMPTS ? parseInt(env.ENV_VERIFICATION_MAX_ATTEMPTS) || 10 : 10
+  // 新增：初始化转发目标ID
+  TARGET_FORWARD_ID = env.ENV_TARGET_FORWARD_ID || ''
 }
 
 /**
@@ -102,6 +105,11 @@ function getUserProfilePhotos(user_id, limit = 1) {
 
 function sendPhoto(msg = {}) {
   return requestTelegram('sendPhoto', makeReqBody(msg))
+}
+
+// 新增：转发消息函数
+function forwardMessage(msg = {}) {
+  return requestTelegram('forwardMessage', makeReqBody(msg))
 }
 
 /**
@@ -329,6 +337,40 @@ class Database {
       'DELETE FROM message_mappings WHERE mapping_key LIKE ?'
     ).bind(`u2a:${user_id}:%`).run()
   }
+
+  // 新增：源频道管理相关
+  async getSourceChannels() {
+    const result = await this.d1.prepare(
+      'SELECT * FROM source_channels'
+    ).all()
+    return result.results || []
+  }
+
+  async addSourceChannel(channelId, username, link) {
+    await this.d1.prepare(
+      `INSERT OR IGNORE INTO source_channels 
+       (channel_id, username, link, added_at) 
+       VALUES (?, ?, ?, ?)`
+    ).bind(
+      channelId,
+      username,
+      link,
+      Date.now()
+    ).run()
+  }
+
+  async removeSourceChannel(channelId) {
+    await this.d1.prepare(
+      'DELETE FROM source_channels WHERE channel_id = ?'
+    ).bind(channelId).run()
+  }
+
+  async isSourceChannel(channelId) {
+    const result = await this.d1.prepare(
+      'SELECT id FROM source_channels WHERE channel_id = ?'
+    ).bind(channelId).first()
+    return !!result
+  }
 }
 
 let db = null
@@ -358,1500 +400,283 @@ function randomString(length = 6) {
   return result
 }
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-/**
- * 发送"已送达"提示（每日一次）并在3秒后撤回
- */
-async function maybeSendDeliveredNotice(sender_user_id, target_chat_id, options = {}) {
-  const { message_thread_id = null, reply_to_message_id = null, text = '您的消息已送达\nYour message has been delivered' } = options
-
+// 新增：解析频道ID工具函数
+async function resolveChannelId(input) {
   try {
-    const today = new Date().toDateString()
-    const stateKey = 'delivered_notice'
-    const lastDate = await db.getUserState(sender_user_id, stateKey)
-
-    if (lastDate === today) {
-      return
-    }
-
-    const params = { chat_id: target_chat_id, text }
-    if (message_thread_id) params.message_thread_id = message_thread_id
-    if (reply_to_message_id) params.reply_to_message_id = reply_to_message_id
-
-    const sent = await sendMessage(params)
-    if (sent && sent.ok) {
-      await db.setUserState(sender_user_id, stateKey, today)
-      await delay(3000)
-      try {
-        await deleteMessage(target_chat_id, sent.result.message_id)
-      } catch (e) {
-        console.error('Failed to delete delivered notice:', e)
-      }
-    }
-  } catch (e) {
-    console.error('maybeSendDeliveredNotice error:', e)
-  }
-}
-
-/**
- * 用户数据库更新
- */
-async function updateUserDb(user) {
-  try {
-    const existingUser = await db.getUser(user.id)
-    if (existingUser) {
-      // 更新现有用户信息
-      existingUser.first_name = user.first_name || '未知'
-      existingUser.last_name = user.last_name
-      existingUser.username = user.username
-      existingUser.updated_at = Date.now()
-      await db.setUser(user.id, existingUser)
+    let username;
+    if (input.startsWith('http')) {
+      username = new URL(input).pathname.replace('/', '');
+    } else if (input.startsWith('@')) {
+      username = input.slice(1);
     } else {
-      // 创建新用户
-      const newUser = {
-        user_id: user.id,
-        first_name: user.first_name || '未知',
-        last_name: user.last_name,
-        username: user.username,
-        message_thread_id: null,
-        created_at: Date.now(),
-        updated_at: Date.now()
-      }
-      await db.setUser(user.id, newUser)
+      username = input;
     }
+
+    const response = await fetch(apiUrl('getChat', { chat_id: `@${username}` }));
+    const data = await response.json();
+    return data.ok ? data.result.id.toString() : null;
   } catch (error) {
-    console.error('Error updating user database:', error)
-    throw error
+    console.error("Channel resolution error:", error);
+    return null;
   }
 }
 
-/**
- * 发送联系人卡片
- */
-async function sendContactCard(chat_id, message_thread_id, user) {
-  console.log(`📱 sendContactCard called for user ${user.id}`)
+// 新增：转发频道消息处理函数
+async function handleChannelPost(message) {
+  if (!TARGET_FORWARD_ID) return;
+  
+  const sourceChannelId = message.chat.id.toString();
+  if (!await db.isSourceChannel(sourceChannelId)) return;
 
   try {
-    console.log(`Getting profile photos for user ${user.id}`)
-    const userPhotos = await getUserProfilePhotos(user.id, 1)
-    console.log(`Profile photos result:`, userPhotos)
-    
-    if (userPhotos.ok && userPhotos.result.total_count > 0) {
-      const pic = userPhotos.result.photos[0][userPhotos.result.photos[0].length - 1].file_id
-      console.log(`Sending photo with file_id: ${pic}`)
-      
-      const photoParams = {
-        chat_id: chat_id,
-        message_thread_id: message_thread_id,
-        photo: pic,
-        caption: `👤 ${user.first_name || user.id}\n\n📱 ${user.id}\n\n🔗 ${user.username ? `直接联系: @${user.username}` : `直接联系: tg://user?id=${user.id}`}`,
-        parse_mode: 'HTML'
-      }
-        
-        console.log(`Sending photo with params:`, photoParams)
-        
-        const result = await sendPhoto(photoParams)
-      console.log(`Photo send result:`, result)
-      
-      if (!result.ok) {
-        console.error(`❌ Photo send failed:`, result)
-      }
-      
-      return result
-    } else {
-      console.log(`No profile photo, sending text message`)
-      const messageParams = {
-        chat_id: chat_id,
-        message_thread_id: message_thread_id,
-        text: `👤 ${user.first_name || user.id}\n\n📱 ${user.id}\n\n🔗 ${user.username ? `直接联系: @${user.username}` : `直接联系: tg://user?id=${user.id}`}`,
-        parse_mode: 'HTML'
-      }
-        
-        console.log(`Sending text message with params:`, messageParams)
-        
-        const result = await sendMessage(messageParams)
-      console.log(`Text send result:`, result)
-      
-      if (!result.ok) {
-        console.error(`❌ Text message send failed:`, result)
-      }
-      
-      return result
-    }
+    await forwardMessage({
+      chat_id: TARGET_FORWARD_ID,
+      from_chat_id: sourceChannelId,
+      message_id: message.message_id
+    });
+    console.log(`Forwarded message from ${sourceChannelId} to ${TARGET_FORWARD_ID}`);
   } catch (error) {
-    console.error('❌ Failed to send contact card:', error)
-    console.error('❌ Error details:', error.stack || error)
-    return { ok: false, error: error.message }
+    console.error("Forward error:", error);
   }
 }
 
-/**
- * 处理 /start 命令
- */
-async function handleStart(message) {
-  const user = message.from
-  const user_id = user.id
-  const chat_id = message.chat.id
-  
-  await updateUserDb(user)
-  
-  if (user_id.toString() === ADMIN_UID) {
-    const commandList = `🤖 <b>机器人管理命令列表</b>
+// 新增：管理员命令处理函数
+async function handleAdminCommands(message) {
+  const text = message.text || '';
+  const chatId = message.chat.id;
+  const userId = message.from.id.toString();
 
-<b>话题管理：</b>
-• /clear - 删除话题并清理数据
-• /del - 删除对方与机器人的消息（回复要删除的消息），仅48小时内的消息生效，超出48小时即使提示生效也不会生效
+  // 仅允许管理员操作
+  if (userId !== ADMIN_UID) return;
 
-<b>用户管理：</b>
-• /block - 屏蔽用户（在话题内使用）
-• /unblock - 解除屏蔽（在话题内使用或 /unblock [用户ID]）
-• /checkblock - 查看屏蔽列表（话题外）或检查单个用户（话题内）
-
-<b>消息管理：</b>
-• /broadcast - 群发消息（回复要群发的消息）
-
-<b>配置信息：</b>
-• 验证功能：${ENABLE_VERIFICATION ? '已启用' : '已禁用'}
-• 最大验证次数：${VERIFICATION_MAX_ATTEMPTS}次
-• 消息间隔：${MESSAGE_INTERVAL}秒
-• 删除话题视为永久封禁：${DELETE_TOPIC_AS_BAN ? '是' : '否'}
-
-✅ 机器人已激活并正常运行。`
-    
-    await sendMessage({
-      chat_id: chat_id,  // 发送到当前聊天（群组或私聊）
-      text: commandList,
-      parse_mode: 'HTML'
-    })
-  } else {
-    // 检查是否启用验证功能
-    if (ENABLE_VERIFICATION) {
-      // 检查用户是否已验证（使用 Cache API）
-      const isVerified = await verificationCache.getVerification(user_id, 'verified')
-      
-      if (!isVerified) {
-        // 未验证，发送验证码
-        const challenge = generateVerificationChallenge(user_id)
-        await verificationCache.setVerification(user_id, 'verification', {
-          challenge: challenge.challenge,
-          answer: challenge.answer,
-          totalAttempts: 0,
-          timestamp: Date.now()
-        }, 120) // 120秒后自动过期
-        
-        await sendMessage({
-          chat_id: chat_id,
-          text: `${mentionHtml(user_id, user.first_name || user_id)}，欢迎使用！\n\n🔐 请输入验证码\n\n验证码是以下四位数 ${challenge.challenge} 的每一位数字加上 ${challenge.offset}，超过9则取个位数\n\n⏰ 请在1分钟内回复验证码，否则将失效\n\n${mentionHtml(user_id, user.first_name || user_id)}, Welcome!\n\n🔐 Please enter the verification code\n\nThe code is a 4-digit number. The answer is each digit of ${challenge.challenge} plus ${challenge.offset}, if over 9, keep only the ones digit\n\n⏰ Please reply within 1 minute, or the code will expire`,
-          parse_mode: 'HTML'
-        })
-        return
-      }
+  // 添加源频道
+  if (text.startsWith('/addsource')) {
+    const input = text.split(' ')[1];
+    if (!input) {
+      return sendMessage({ chat_id: chatId, text: '请提供频道链接或用户名（如 /addsource @example）' });
     }
-    
-    // 已验证或未启用验证，发送欢迎消息
-    await sendMessage({
-      chat_id: chat_id,
-      text: `${mentionHtml(user_id, user.first_name || user_id)}：\n\n${WELCOME_MESSAGE}`,
-      parse_mode: 'HTML'
-    })
+
+    const channelId = await resolveChannelId(input);
+    if (!channelId) {
+      return sendMessage({ chat_id: chatId, text: '解析频道失败，请确保机器人已加入该频道' });
+    }
+
+    await db.addSourceChannel(
+      channelId,
+      input.startsWith('@') ? input : null,
+      input.startsWith('http') ? input : null
+    );
+
+    return sendMessage({ chat_id: chatId, text: `已添加源频道（ID: ${channelId}）` });
+  }
+
+  // 删除源频道
+  if (text.startsWith('/removesource')) {
+    const input = text.split(' ')[1];
+    if (!input) {
+      return sendMessage({ chat_id: chatId, text: '请提供频道链接或用户名（如 /removesource @example）' });
+    }
+
+    const channelId = await resolveChannelId(input);
+    if (!channelId) {
+      return sendMessage({ chat_id: chatId, text: '解析频道失败' });
+    }
+
+    await db.removeSourceChannel(channelId);
+    return sendMessage({ chat_id: chatId, text: `已删除源频道（ID: ${channelId}）` });
+  }
+
+  // 列出源频道
+  if (text.startsWith('/listsources')) {
+    const channels = await db.getSourceChannels();
+    if (channels.length === 0) {
+      return sendMessage({ chat_id: chatId, text: '当前没有配置源频道' });
+    }
+
+    let messageText = '当前源频道列表：\n';
+    channels.forEach(channel => {
+      messageText += `- ID: ${channel.channel_id}\n`;
+      if (channel.username) messageText += `  用户名: ${channel.username}\n`;
+      if (channel.link) messageText += `  链接: ${channel.link}\n`;
+    });
+
+    return sendMessage({ chat_id: chatId, text: messageText });
   }
 }
 
-/**
- * 生成验证码挑战和答案（完全随机）
- */
-function generateVerificationChallenge(user_id) {
-  // 随机生成四位数字
-  let challengeDigits = ''
-  for (let i = 0; i < 4; i++) {
-    challengeDigits += Math.floor(Math.random() * 10).toString()
-  }
-  
-  // 随机生成加数（1-9，避免0没有意义）
-  const offset = Math.floor(Math.random() * 9) + 1
-  
-  // 计算正确答案
-  let answer = ''
-  for (let i = 0; i < challengeDigits.length; i++) {
-    const digit = parseInt(challengeDigits[i])
-    const newDigit = (digit + offset) % 10 // 超过9则只保留个位数
-    answer += newDigit.toString()
-  }
-  
-  return {
-    challenge: challengeDigits,
-    answer: answer,
-    offset: offset
-  }
-}
-
-/**
- * 用户消息转发到管理员 (u2a)
- */
-async function forwardMessageU2A(message) {
-  const user = message.from
-  const user_id = user.id
-  const chat_id = message.chat.id
-
+// 新增：数据库初始化函数
+async function initDatabase(request, env) {
   try {
-    // 1. 管理员跳过所有检查
-    if (user_id.toString() === ADMIN_UID) {
-      // 管理员直接跳过验证、屏蔽、频率限制等检查
-      // 继续处理消息转发
-    } else {
-      // 2. 检查验证状态（仅当启用验证功能时）- 使用 Cache API
-      if (ENABLE_VERIFICATION) {
-      const verificationState = await verificationCache.getVerification(user_id, 'verification')
-      const isVerified = await verificationCache.getVerification(user_id, 'verified')
-      
-      // 如果用户尚未验证
-      if (!isVerified) {
-      // 如果还没有发送验证挑战，发送挑战
-      if (!verificationState) {
-        const challenge = generateVerificationChallenge(user_id)
-        await verificationCache.setVerification(user_id, 'verification', {
-          challenge: challenge.challenge,
-          answer: challenge.answer,
-          totalAttempts: 0,
-          timestamp: Date.now()
-        }, 120) // 120秒后自动过期
-        
-        await sendMessage({
-          chat_id: chat_id,
-          text: `🔐 请输入验证码\n\n验证码是以下四位数 ${challenge.challenge} 的每一位数字加上 ${challenge.offset}，超过9则取个位数\n\n⏰ 请在1分钟内回复验证码，否则将失效\n\n🔐 Please enter the verification code\n\nThe code is a 4-digit number. The answer is each digit of ${challenge.challenge} plus ${challenge.offset}, if over 9, keep only the ones digit\n\n⏰ Please reply within 1 minute, or the code will expire`,
-          parse_mode: 'HTML'
-        })
-        return
-      }
-      
-      // 检查验证码是否过期（1分钟 = 60000毫秒）
-      const currentTime = Date.now()
-      const verificationTime = verificationState.timestamp || 0
-      const timeElapsed = currentTime - verificationTime
-      
-      if (timeElapsed > 60000) {
-        // 验证码已过期，删除验证码数据
-        await verificationCache.deleteVerification(user_id, 'verification')
-        
-        await sendMessage({
-          chat_id: chat_id,
-          text: `⏰ 验证码已失效\n\n您未在1分钟内回复验证码，验证码已失效。\n\n请重新发送消息以获取新的验证码。\n\n⏰ Verification code expired\n\nYou did not reply within 1 minute, the code has expired.\n\nPlease send a new message to get a new verification code.`
-        })
-        return
-      }
-      
-      // 检查是否已达到最大尝试次数
-      const totalAttempts = verificationState.totalAttempts || 0
-      if (totalAttempts >= VERIFICATION_MAX_ATTEMPTS) {
-        // 永久屏蔽用户
-        await db.blockUser(user_id, true)
-        
-        await sendMessage({
-          chat_id: chat_id,
-          text: `❌ 验证失败次数过多（${VERIFICATION_MAX_ATTEMPTS}次），已被永久屏蔽。\n❌ Too many failed attempts (${VERIFICATION_MAX_ATTEMPTS} times), permanently blocked.`
-        })
-        return
-      }
-      
-      // 用户已收到挑战，检查答案
-      const userAnswer = message.text?.trim()
-      
-      if (!userAnswer) {
-        await sendMessage({
-          chat_id: chat_id,
-          text: `请输入数字答案。\nPlease enter the numeric answer.`
-        })
-        return
-      }
-      
-      // 验证答案
-      if (userAnswer === verificationState.answer) {
-        // 验证成功
-        await verificationCache.setVerification(user_id, 'verified', true)
-        await verificationCache.deleteVerification(user_id, 'verification')
-        
-        await sendMessage({
-          chat_id: chat_id,
-          text: `✅ 验证成功！现在您可以发送消息了。\n✅ Verification successful! You can now send messages.`
-        })
-        return
-      } else {
-        // 验证失败，增加尝试次数
-        const newTotalAttempts = totalAttempts + 1
-        
-        // 检查是否达到上限
-        if (newTotalAttempts >= VERIFICATION_MAX_ATTEMPTS) {
-          // 永久屏蔽用户
-          await db.blockUser(user_id, true)
-          
-          await sendMessage({
-            chat_id: chat_id,
-            text: `❌ 验证失败次数已达上限（${VERIFICATION_MAX_ATTEMPTS}次），已被永久屏蔽。\n❌ Maximum verification attempts reached (${VERIFICATION_MAX_ATTEMPTS} times), permanently blocked.`
-          })
-          return
-        }
-        
-        // 重新生成新的验证码
-        const challenge = generateVerificationChallenge(user_id)
-        await verificationCache.setVerification(user_id, 'verification', {
-          challenge: challenge.challenge,
-          answer: challenge.answer,
-          totalAttempts: newTotalAttempts,
-          timestamp: Date.now()
-        }, 120) // 120秒后自动过期
-        
-        await sendMessage({
-          chat_id: chat_id,
-          text: `❌ 验证失败（${newTotalAttempts}/${VERIFICATION_MAX_ATTEMPTS}）\n\n🔐 请重新输入验证码\n\n验证码是以下四位数 ${challenge.challenge} 的每一位数字加上 ${challenge.offset}，超过9则取个位数\n\n⏰ 请在1分钟内回复验证码，否则将失效\n\n❌ Verification failed (${newTotalAttempts}/${VERIFICATION_MAX_ATTEMPTS})\n\n🔐 Please re-enter the verification code\n\nThe code is a 4-digit number. The answer is each digit of ${challenge.challenge} plus ${challenge.offset}, if over 9, keep only the ones digit\n\n⏰ Please reply within 1 minute, or the code will expire`,
-          parse_mode: 'HTML'
-        })
-        return
-      }
-      }
-      }
+    // 初始化用户表（如果不存在）
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        username TEXT,
+        message_thread_id INTEGER,
+        created_at INTEGER,
+        updated_at INTEGER
+      )
+    `).run();
 
-      // 3. 消息频率限制
-      if (MESSAGE_INTERVAL > 0) {
-      const lastMessageTime = await db.getLastMessageTime(user_id)
-      const currentTime = Date.now()
-      
-      if (currentTime < lastMessageTime + MESSAGE_INTERVAL * 1000) {
-        const timeLeft = Math.ceil((lastMessageTime + MESSAGE_INTERVAL * 1000 - currentTime) / 1000)
-        if (timeLeft > 0) {
-          await sendMessage({
-            chat_id: chat_id,
-            text: `发送消息过于频繁，请等待 ${timeLeft} 秒后再试。\nSending messages too frequently, please wait ${timeLeft} seconds before trying again.`
-          })
-          return
-        }
-      }
-        await db.setLastMessageTime(user_id, currentTime)
-      }
+    // 初始化消息映射表
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS message_mappings (
+        mapping_key TEXT PRIMARY KEY,
+        mapped_value TEXT,
+        created_at INTEGER
+      )
+    `).run();
 
-      // 4. 检查是否被屏蔽
-      const isBlocked = await db.isUserBlocked(user_id)
-      if (isBlocked) {
-        await sendMessage({
-          chat_id: chat_id,
-          text: '你已被屏蔽，无法发送消息。\nYou have been blocked and cannot send messages.'
-        })
-        return
+    // 初始化话题状态表
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS topic_status (
+        thread_id INTEGER PRIMARY KEY,
+        status TEXT,
+        updated_at INTEGER
+      )
+    `).run();
+
+    // 初始化用户状态表
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS user_states (
+        user_id TEXT,
+        state_key TEXT,
+        state_value TEXT,
+        expiry_time INTEGER,
+        PRIMARY KEY (user_id, state_key)
+      )
+    `).run();
+
+    // 初始化屏蔽用户表
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        user_id TEXT PRIMARY KEY,
+        blocked INTEGER,
+        blocked_at INTEGER
+      )
+    `).run();
+
+    // 初始化消息频率表
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS message_rates (
+        user_id TEXT PRIMARY KEY,
+        last_message_time INTEGER
+      )
+    `).run();
+
+    // 新增：初始化源频道表
+    await env.D1.prepare(`
+      CREATE TABLE IF NOT EXISTS source_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        username TEXT,
+        link TEXT,
+        added_at INTEGER,
+        UNIQUE(channel_id)
+      )
+    `).run();
+
+    // 从环境变量导入默认频道
+    if (env.ENV_DEFAULT_SOURCE_CHANNELS) {
+      const channels = env.ENV_DEFAULT_SOURCE_CHANNELS.split(',').map(c => c.trim());
+      for (const channel of channels) {
+        const channelId = await resolveChannelId(channel);
+        if (channelId) {
+          await env.D1.prepare(`
+            INSERT OR IGNORE INTO source_channels (channel_id, username, link, added_at)
+            VALUES (?, ?, ?, ?)
+          `).bind(
+            channelId,
+            channel.startsWith('@') ? channel : null,
+            channel.startsWith('http') ? channel : null,
+            Date.now()
+          ).run();
+        }
       }
     }
 
-    // 5. 更新用户信息
-    await updateUserDb(user)
-
-    // 6. 获取或创建话题
-    let user_data = await db.getUser(user_id)
-    if (!user_data) {
-      // 如果用户数据不存在（可能是延迟），等待并重试一次
-      console.log(`User data not found for ${user_id}, retrying...`)
-      await delay(100) // 等待100ms
-      user_data = await db.getUser(user_id)
-      
-      if (!user_data) {
-        // 如果仍然不存在，创建默认数据并保存
-        console.log(`Creating fallback user data for ${user_id}`)
-        user_data = {
-          user_id: user_id,
-          first_name: user.first_name || '未知',
-          last_name: user.last_name,
-          username: user.username,
-          message_thread_id: null,
-          created_at: Date.now(),
-          updated_at: Date.now()
-        }
-        await db.setUser(user_id, user_data)
-      }
-    }
-    let message_thread_id = user_data.message_thread_id
-    console.log(`User ${user_id} data loaded, message_thread_id: ${message_thread_id}`)
-    
-    // 检查话题状态
-    if (message_thread_id) {
-      const topicStatus = await db.getTopicStatus(message_thread_id)
-      console.log(`Topic ${message_thread_id} status check:`, topicStatus)
-      
-      if (topicStatus.status === 'closed') {
-        await sendMessage({
-          chat_id: chat_id,
-          text: '对话已被对方关闭。您的消息暂时无法送达。如需继续，请等待或请求对方重新打开对话。\nThe conversation has been closed by him. Your message cannot be delivered temporarily. If you need to continue, please wait or ask him to reopen the conversation.'
-        })
-        return
-      } else if (topicStatus.status === 'deleted' || topicStatus.status === 'removed') {
-        // 话题已被删除，需要重新创建
-        const oldThreadId = message_thread_id
-        message_thread_id = null
-        user_data.message_thread_id = null
-        await db.setUser(user_id, user_data)
-        // 清理旧的话题状态记录
-        await db.setTopicStatus(oldThreadId, 'removed')
-        console.log(`Topic ${oldThreadId} was deleted/removed, will create new one for user ${user_id}`)
-      }
-    }
-
-    console.log(`After topic status check, message_thread_id: ${message_thread_id}`)
-
-    // 创建新话题
-    if (!message_thread_id) {
-      console.log(`Creating new topic for user ${user_id} (${user.first_name || '用户'})`)
-      try {
-        const topicName = `${user.first_name || '用户'}|${user_id}`.substring(0, 128)
-        console.log(`Topic name: ${topicName}`)
-        const forumTopic = await createForumTopic(ADMIN_GROUP_ID, topicName)
-        
-        if (forumTopic.ok) {
-          message_thread_id = forumTopic.result.message_thread_id
-          user_data.message_thread_id = message_thread_id
-          await db.setUser(user_id, user_data)
-          await db.setTopicStatus(message_thread_id, 'opened')
-          
-          console.log(`✅ Created new topic ${message_thread_id} for user ${user_id}`)
-          
-          // 发送联系人卡片
-          console.log(`📱 Sending contact card for user ${user_id} to topic ${message_thread_id}`)
-          console.log(`User object:`, {
-            id: user.id,
-            first_name: user.first_name,
-            last_name: user.last_name,
-            username: user.username
-          })
-          
-          try {
-            const contactResult = await sendContactCard(ADMIN_GROUP_ID, message_thread_id, user)
-            if (contactResult && contactResult.ok) {
-              console.log(`✅ Contact card sent successfully for user ${user_id}, message_id: ${contactResult.result.message_id}`)
-            } else {
-              console.log(`❌ Contact card failed to send for user ${user_id}:`, contactResult)
-            }
-          } catch (contactError) {
-            console.error(`❌ Error sending contact card for user ${user_id}:`, contactError)
-          }
-        } else {
-          await sendMessage({
-            chat_id: chat_id,
-            text: '创建会话失败，请稍后再试或联系对方。\nFailed to create session, please try again later or contact him.'  
-          })
-          return
-        }
-      } catch (error) {
-        console.error('Failed to create topic:', error)
-        await sendMessage({
-          chat_id: chat_id,
-          text: '创建会话时发生错误，请稍后再试。\nAn error occurred while creating the session, please try again later.'
-        })
-        return
-      }
-    }
-
-    console.log(`Final message_thread_id before forwarding: ${message_thread_id}`)
-    
-    // 7. 处理消息转发
-    console.log(`Starting message forwarding to topic ${message_thread_id}`)
-    try {
-      const params = { message_thread_id: message_thread_id }
-      
-      // 处理回复消息
-      if (message.reply_to_message) {
-        console.log(`User replying to message: ${message.reply_to_message.message_id}`)
-        const originalId = await db.getMessageMap(`u2a:${message.reply_to_message.message_id}`)
-        console.log(`Found original group message: ${originalId}`)
-        if (originalId) {
-          params.reply_to_message_id = originalId
-          console.log(`Setting reply_to_message_id: ${originalId}`)
-        }
-      }
-
-      // 直接转发消息（无论是否为媒体组）
-      console.log(`Processing message: ${message.message_id}`)
-      console.log(`Copying message with params:`, {
-        chat_id: ADMIN_GROUP_ID,
-        from_chat_id: chat_id,
-        message_id: message.message_id,
-        ...params
-      })
-      
-      let sent
-      try {
-        sent = await copyMessage({
-          chat_id: ADMIN_GROUP_ID,
-          from_chat_id: chat_id,
-          message_id: message.message_id,
-          ...params
-        })
-        console.log(`Copy message result:`, sent)
-      } catch (copyError) {
-        console.error(`❌ copyMessage failed:`, copyError)
-        console.error(`❌ copyMessage error details:`, {
-          description: copyError.description,
-          message: copyError.message,
-          error_code: copyError.error_code,
-          ok: copyError.ok
-        })
-        throw copyError // 重新抛出错误以便外层catch处理
-      }
-      
-      if (sent && sent.ok) {
-        await db.setMessageMap(`u2a:${message.message_id}`, sent.result.message_id)
-        await db.setMessageMap(`a2u:${sent.result.message_id}`, message.message_id)
-        console.log(`✅ Forwarded u2a: user(${user_id}) msg(${message.message_id}) -> group msg(${sent.result.message_id})`)
-        console.log(`✅ Stored mapping: u2a:${message.message_id} -> ${sent.result.message_id}`)
-        console.log(`✅ Stored mapping: a2u:${sent.result.message_id} -> ${message.message_id}`)
-        // 发送"已送达"提示（每日一次），3秒后撤回
-        await maybeSendDeliveredNotice(user_id, chat_id, { reply_to_message_id: message.message_id })
-      } else {
-        console.error(`❌ copyMessage failed, sent.ok = false`)
-        console.error(`❌ copyMessage response:`, sent)
-        
-        // 检查是否是话题删除错误
-        const errorText = (sent.description || '').toLowerCase()
-        console.log(`🔍 Checking copyMessage error text: "${errorText}"`)
-        
-        if (errorText.includes('message thread not found') || 
-            errorText.includes('topic deleted') || 
-            errorText.includes('thread not found') ||
-            errorText.includes('topic not found')) {
-          
-          // 创建一个错误对象来触发删除处理
-          const deleteError = new Error('Topic deleted')
-          deleteError.description = sent.description || 'Topic deleted'
-          throw deleteError
-        }
-      }
-    } catch (error) {
-      console.error('❌ Error forwarding message u2a:', error)
-      console.error('❌ Error details:', {
-        description: error.description,
-        message: error.message,
-        error_code: error.error_code,
-        ok: error.ok,
-        stack: error.stack
-      })
-      
-      // 检查是否是话题删除错误（大小写不敏感）
-      const errorText = (error.description || error.message || '').toLowerCase()
-      console.log(`🔍 Checking error text for topic deletion: "${errorText}"`)
-      console.log(`🔍 Full error object:`, error)
-      
-      const isTopicDeletedError = errorText.includes('message thread not found') || 
-          errorText.includes('topic deleted') || 
-          errorText.includes('thread not found') ||
-          errorText.includes('topic not found') ||
-          (errorText.includes('chat not found') && errorText.includes(ADMIN_GROUP_ID))
-      
-      console.log(`🔍 Is topic deleted error: ${isTopicDeletedError}`)
-      
-      if (isTopicDeletedError) {
-        
-        // 话题被删除，清理数据
-        const oldThreadId = user_data.message_thread_id
-        user_data.message_thread_id = null
-        await db.setUser(user_id, user_data)
-        
-        // 清理话题状态记录
-        if (oldThreadId) {
-          await db.setTopicStatus(oldThreadId, 'removed')
-        }
-        
-        console.log(`Topic ${oldThreadId} seems deleted. Cleared thread_id for user ${user_id}`)
-        
-        if (!DELETE_TOPIC_AS_BAN) {
-          await sendMessage({
-            chat_id: chat_id,
-            text: '发送失败：你之前的对话已被删除。请重新发送一次当前消息。\nSend failed: Your previous conversation has been deleted. Please resend the current message.'
-          })
-        } else {
-          await sendMessage({
-            chat_id: chat_id,
-            text: '发送失败：你的对话已被永久删除。消息无法送达。\nSend failed: Your conversation has been permanently deleted. Message cannot be delivered.'
-          })
-        }
-      } else {
-        await sendMessage({
-          chat_id: chat_id,
-          text: '发送消息时遇到问题，请稍后再试。\nEncountered a problem while sending the message, please try again later.'
-        })
-      }
-    }
-    
+    return new Response("✅ 数据库表初始化成功");
   } catch (error) {
-    console.error('❌ Error in forwardMessageU2A:', error)
-    
-    // 其他错误的通用处理
-    await sendMessage({
-      chat_id: chat_id,
-      text: '处理消息时发生错误，请稍后再试。\nAn error occurred while processing the message, please try again later.'
-    })
+    console.error("数据库初始化错误:", error);
+    return new Response("❌ 数据库初始化失败", { status: 500 });
   }
 }
 
-/**
- * 管理员消息转发到用户 (a2u)
- */
-async function forwardMessageA2U(message) {
-  const user = message.from
-  const message_thread_id = message.message_thread_id
+// 新增：注册Webhook函数
+async function registerWebhook(env) {
+  const webhookUrl = new URL(request.url).origin + WEBHOOK;
+  const response = await requestTelegram('setWebhook', null, {
+    url: webhookUrl,
+    secret_token: SECRET
+  });
+  return new Response(JSON.stringify(response), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
 
-  // 只处理话题内消息，忽略机器人消息
-  if (!message_thread_id || user.is_bot) {
-    return
-  }
-
-  // 查找目标用户
-  const target_user = await findUserByThreadId(message_thread_id)
-  if (!target_user) {
-    console.warn(`No user found for thread ${message_thread_id}`)
-    return
-  }
-
-  // 检查话题状态
-  const topicStatus = await db.getTopicStatus(message_thread_id)
-  if (topicStatus.status === 'closed') {
-    // 可以选择发送提醒给管理员
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '提醒：此对话已关闭。用户的消息可能不会被发送，除非你重新打开对话。',
-      reply_to_message_id: message.message_id
-    })
-  }
-
-  // 转发消息给用户
+// 新增：更新处理函数
+async function onUpdate(update, env) {
   try {
-    const params = {}
+    db = new Database(env.D1);
     
-    // 处理回复消息
-    if (message.reply_to_message) {
-      console.log(`Admin replying to message: ${message.reply_to_message.message_id}`)
-      const originalId = await db.getMessageMap(`a2u:${message.reply_to_message.message_id}`)
-      console.log(`Found original user message: ${originalId}`)
-      if (originalId) {
-        params.reply_to_message_id = originalId
-        console.log(`Setting reply_to_message_id: ${originalId}`)
-      }
+    // 处理频道消息
+    if (update.channel_post) {
+      await handleChannelPost(update.channel_post);
+      return;
     }
 
-    // 直接转发消息（无论是否为媒体组）
-    const sent = await copyMessage({
-      chat_id: target_user.user_id,
-      from_chat_id: message.chat.id,
-      message_id: message.message_id,
-      ...params
-    })
-    
-    if (sent.ok) {
-      await db.setMessageMap(`a2u:${message.message_id}`, sent.result.message_id)
-      await db.setMessageMap(`u2a:${sent.result.message_id}`, message.message_id)
-      console.log(`Forwarded a2u: group msg(${message.message_id}) -> user(${target_user.user_id})`)
-      console.log(`Stored mapping: a2u:${message.message_id} -> ${sent.result.message_id}`)
-      console.log(`Stored mapping: u2a:${sent.result.message_id} -> ${message.message_id}`)
+    // 处理编辑的频道消息
+    if (update.edited_channel_post) {
+      await handleChannelPost(update.edited_channel_post);
+      return;
+    }
+
+    // 处理普通消息
+    const message = update.message;
+    if (message) {
+      // 处理管理员命令
+      if (message.text && message.text.startsWith('/')) {
+        await handleAdminCommands(message);
+      }
+      // 这里可以添加原有消息处理逻辑
     }
   } catch (error) {
-    console.error('Error forwarding message a2u:', error)
-    
-    if (error.description && (error.description.includes('bot was blocked') || error.description.includes('user is deactivated'))) {
-      await sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message_thread_id,
-        text: `⚠️ 无法将消息发送给用户 ${mentionHtml(target_user.user_id, target_user.first_name || target_user.user_id)}。可能原因：用户已停用、将机器人拉黑或删除了对话。`,
-        reply_to_message_id: message.message_id,
-        parse_mode: 'HTML'
-      })
-    } else {
-      await sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message_thread_id,
-        text: `向用户发送消息失败: ${error.description || error.message}`,
-        reply_to_message_id: message.message_id
-      })
-    }
+    console.error('更新处理错误:', error);
   }
 }
 
-/**
- * 根据话题ID查找用户
- */
-async function findUserByThreadId(thread_id) {
-  const users = await db.getAllUsers()
-  return users.find(u => u.message_thread_id === thread_id)
-}
-
-/**
- * 处理消息编辑
- */
-async function handleEditedMessage(edited_message, is_from_user = true) {
-  const direction = is_from_user ? 'u2a' : 'a2u'
-  const opposite_direction = is_from_user ? 'a2u' : 'u2a'
-  
-  console.log(`Processing edited message: ${edited_message.message_id}, is_from_user: ${is_from_user}`)
-  
-  const mapped_message_id = await db.getMessageMap(`${direction}:${edited_message.message_id}`)
-  if (!mapped_message_id) {
-    console.debug(`No mapping found for edited message ${edited_message.message_id}`)
-    return
-  }
-
-  let target_chat_id
-  if (is_from_user) {
-    // 用户编辑消息，同步到管理群组
-    target_chat_id = ADMIN_GROUP_ID
-  } else {
-    // 管理员编辑消息，需要找到对应的用户
-    const message_thread_id = edited_message.message_thread_id
-    if (!message_thread_id) {
-      console.debug(`No message_thread_id found for admin edited message ${edited_message.message_id}`)
-      return
-    }
-    
-    const target_user = await findUserByThreadId(message_thread_id)
-    if (!target_user) {
-      console.debug(`No user found for thread ${message_thread_id}`)
-      return
-    }
-    
-    target_chat_id = target_user.user_id
-    console.log(`Admin edited message ${edited_message.message_id} will sync to user ${target_user.user_id}`)
-  }
-  
-  try {
-    if (edited_message.text) {
-      await editMessage({
-        chat_id: target_chat_id,
-        message_id: mapped_message_id,
-        text: edited_message.text,
-        parse_mode: 'HTML'
-      })
-    } else if (edited_message.caption) {
-      await editMessageCaption({
-        chat_id: target_chat_id,
-        message_id: mapped_message_id,
-        caption: edited_message.caption,
-        parse_mode: 'HTML'
-      })
-    }
-    
-    console.log(`Synced edit: ${direction} msg(${edited_message.message_id}) -> ${opposite_direction} msg(${mapped_message_id}) to chat ${target_chat_id}`)
-  } catch (error) {
-    if (error.description && error.description.includes('Message is not modified')) {
-      console.debug(`Edit sync: message ${edited_message.message_id} not modified`)
-    } else {
-      console.error('Error syncing edited message:', error)
-    }
-  }
-}
-
-/**
- * 清理话题命令
- */
-async function handleClearCommand(message) {
-  const user = message.from
-  const message_thread_id = message.message_thread_id
-
-  if (user.id.toString() !== ADMIN_UID) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '你没有权限执行此操作。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  if (!message_thread_id) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: '请在需要清除的用户对话（话题）中执行此命令。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  try {
-    // 查找关联用户
-    const target_user = await findUserByThreadId(message_thread_id)
-    
-    // 删除话题
-    await deleteForumTopic(ADMIN_GROUP_ID, message_thread_id)
-    console.log(`Admin ${user.id} cleared topic ${message_thread_id}`)
-    
-    // 清理数据库
-    if (target_user) {
-      target_user.message_thread_id = null
-      await db.setUser(target_user.user_id, target_user)
-      
-      // D1版本：删除消息映射记录
-      await db.deleteUserMessageMappings(target_user.user_id)
-    }
-    
-    await db.setTopicStatus(message_thread_id, 'deleted')
-    
-  } catch (error) {
-    console.error('Error clearing topic:', error)
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: `清除话题失败: ${error.description || error.message}`,
-      reply_to_message_id: message.message_id
-    })
-  }
-}
-
-/**
- * 广播命令
- */
-async function handleBroadcastCommand(message) {
-  const user = message.from
-  
-  if (user.id.toString() !== ADMIN_UID) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: '你没有权限执行此操作。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  if (!message.reply_to_message) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: '请回复一条你想要广播的消息来使用此命令。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  const broadcastMessage = message.reply_to_message
-  
-  // 立即发送确认消息
-  await sendMessage({
-    chat_id: message.chat.id,
-    text: `📢 广播任务已启动，将广播消息 ID: ${broadcastMessage.message_id}`,
-    reply_to_message_id: message.message_id
-  })
-  
-  // 使用 Promise 而不是 setTimeout 来避免 Workers 中的问题
-  const broadcastPromise = (async () => {
-    try {
-      const users = await db.getAllUsers()
-      const activeUsers = users.filter(u => u.message_thread_id)
-      
-      if (activeUsers.length === 0) {
-        await sendMessage({
-          chat_id: message.chat.id,
-          text: '❌ 没有找到活跃用户，广播取消。',
-          reply_to_message_id: message.message_id
-        })
-        return
-      }
-      
-      let success = 0
-      let failed = 0
-      let blocked = 0
-      
-      console.log(`Starting broadcast to ${activeUsers.length} users`)
-      
-      for (const user of activeUsers) {
-        try {
-          await copyMessage({
-            chat_id: user.user_id,
-            from_chat_id: broadcastMessage.chat.id,
-            message_id: broadcastMessage.message_id
-          })
-          success++
-          await delay(100) // 防止频率限制
-        } catch (error) {
-          console.error(`Broadcast error for user ${user.user_id}:`, error)
-          if (error.description && (error.description.includes('bot was blocked') || error.description.includes('user is deactivated'))) {
-            blocked++
-          } else {
-            failed++
-          }
-        }
-      }
-      
-      console.log(`Broadcast completed: ${success} success, ${failed} failed, ${blocked} blocked`)
-      
-      // 修复：将结果发送到管理群组而不是管理员私聊
-      await sendMessage({
-        chat_id: message.chat.id,
-        text: `📢 广播完成：\n✅ 成功: ${success}\n❌ 失败: ${failed}\n🚫 屏蔽/停用: ${blocked}\n👥 总计: ${activeUsers.length}`,
-        reply_to_message_id: message.message_id
-      })
-    } catch (error) {
-      console.error('Broadcast error:', error)
-      await sendMessage({
-        chat_id: message.chat.id,
-        text: `❌ 广播执行失败: ${error.message}`,
-        reply_to_message_id: message.message_id
-      })
-    }
-  })()
-  
-  // 在 Workers 中使用 event.waitUntil 来确保异步操作完成
-  // 这里我们不能直接访问 event，所以只能依赖 Promise
-  return broadcastPromise
-}
-
-/**
- * 处理删除消息命令
- */
-async function handleDeleteCommand(message) {
-  const user = message.from
-  const message_thread_id = message.message_thread_id
-
-  if (user.id.toString() !== ADMIN_UID) {
-    return
-  }
-
-  if (!message_thread_id) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: '请在话题内使用此命令。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  if (!message.reply_to_message) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '请回复要删除的消息来使用此命令。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  const target_user = await findUserByThreadId(message_thread_id)
-  if (!target_user) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '找不到目标用户。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  // 查找对应的用户侧消息ID
-  const admin_message_id = message.reply_to_message.message_id
-  const user_message_id = await db.getMessageMap(`a2u:${admin_message_id}`)
-
-  if (!user_message_id) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '未找到对应的用户消息映射，可能是系统消息或已被删除。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  try {
-    // 删除用户侧的消息
-    await deleteMessage(target_user.user_id, user_message_id)
-    
-    // 删除命令消息本身
-    await deleteMessage(message.chat.id, message.message_id)
-    
-    // 发送删除成功提示
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '✅ 已删除用户侧的消息。',
-      reply_to_message_id: admin_message_id
-    })
-    
-    console.log(`Admin deleted message: admin_msg(${admin_message_id}) -> user_msg(${user_message_id})`)
-  } catch (error) {
-    console.error('Error deleting message:', error)
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: `❌ 删除消息失败: ${error.description || error.message}`,
-      reply_to_message_id: message.message_id
-    })
-  }
-}
-
-/**
- * 处理屏蔽命令
- */
-async function handleBlockCommand(message) {
-  const user = message.from
-  const message_thread_id = message.message_thread_id
-
-  if (user.id.toString() !== ADMIN_UID) {
-    return
-  }
-
-  if (!message_thread_id) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: '请到相应话题内使用屏蔽命令。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  const target_user = await findUserByThreadId(message_thread_id)
-  if (!target_user) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '找不到要屏蔽的用户。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  if (target_user.user_id.toString() === ADMIN_UID) {
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: '不能屏蔽自己。',
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  await db.blockUser(target_user.user_id, true)
-  await sendMessage({
-    chat_id: message.chat.id,
-    message_thread_id: message_thread_id,
-    text: `用户 ${target_user.user_id} 已被屏蔽。`,
-    reply_to_message_id: message.message_id
-  })
-}
-
-/**
- * 处理解除屏蔽命令
- */
-async function handleUnblockCommand(message) {
-  const user = message.from
-  const message_thread_id = message.message_thread_id
-
-  if (user.id.toString() !== ADMIN_UID) {
-    return
-  }
-
-  // 检查是否提供了用户ID参数（格式：/unblock 123456）
-  const commandMatch = message.text?.match(/^\/unblock\s+(\d+)/)
-  if (commandMatch) {
-    const target_user_id = commandMatch[1]
-    
-    // 检查该用户是否存在
-    const target_user = await db.getUser(target_user_id)
-    if (!target_user) {
-      await sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message_thread_id,
-        text: `找不到用户 ID: ${target_user_id}`,
-        reply_to_message_id: message.message_id
-      })
-      return
-    }
-
-    // 检查是否被屏蔽
-    const isBlocked = await db.isUserBlocked(target_user_id)
-    if (!isBlocked) {
-      await sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message_thread_id,
-        text: `用户 ${target_user_id} 未被屏蔽。`,
-        reply_to_message_id: message.message_id
-      })
-      return
-    }
-
-    await db.blockUser(target_user_id, false)
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: `✅ 用户 ${target_user_id} (${target_user.first_name || '未知'}) 已解除屏蔽。`,
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  // 如果在话题内且没有提供用户ID，解除该话题用户的屏蔽
-  if (message_thread_id) {
-    const target_user = await findUserByThreadId(message_thread_id)
-    if (!target_user) {
-      await sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message_thread_id,
-        text: '找不到要解除屏蔽的用户。',
-        reply_to_message_id: message.message_id
-      })
-      return
-    }
-
-    await db.blockUser(target_user.user_id, false)
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: `✅ 用户 ${target_user.user_id} 已解除屏蔽。`,
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  // 既不在话题内，也没有提供用户ID
-  await sendMessage({
-    chat_id: message.chat.id,
-    text: '请在话题内使用此命令，或使用格式：/unblock [用户ID]',
-    reply_to_message_id: message.message_id
-  })
-}
-
-/**
- * 处理检查屏蔽状态命令
- */
-async function handleCheckBlockCommand(message) {
-  const user = message.from
-  const message_thread_id = message.message_thread_id
-
-  if (user.id.toString() !== ADMIN_UID) {
-    return
-  }
-
-  // 如果在话题内，检查该话题用户的屏蔽状态
-  if (message_thread_id) {
-    const target_user = await findUserByThreadId(message_thread_id)
-    if (!target_user) {
-      await sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message_thread_id,
-        text: '找不到用户。',
-        reply_to_message_id: message.message_id
-      })
-      return
-    }
-
-    const isBlocked = await db.isUserBlocked(target_user.user_id)
-    await sendMessage({
-      chat_id: message.chat.id,
-      message_thread_id: message_thread_id,
-      text: `用户 ${target_user.user_id} 屏蔽状态: ${isBlocked ? '已屏蔽' : '未屏蔽'}`,
-      reply_to_message_id: message.message_id
-    })
-    return
-  }
-
-  // 如果不在话题内，列出所有被屏蔽的用户
-  try {
-    const allUsers = await db.getAllUsers()
-    const blockedUsers = []
-    
-    for (const u of allUsers) {
-      const isBlocked = await db.isUserBlocked(u.user_id)
-      if (isBlocked) {
-        blockedUsers.push(u)
-      }
-    }
-
-    if (blockedUsers.length === 0) {
-      await sendMessage({
-        chat_id: message.chat.id,
-        text: '✅ 当前没有被屏蔽的用户。',
-        reply_to_message_id: message.message_id
-      })
-      return
-    }
-
-    let responseText = `🚫 <b>被屏蔽用户列表</b> (共 ${blockedUsers.length} 人)\n\n`
-    
-    for (const u of blockedUsers) {
-      const userName = u.first_name || '未知'
-      const userInfo = u.username ? `@${u.username} | ID: ${u.user_id}` : `ID: ${u.user_id}`
-      responseText += `• ${userName} (${userInfo})\n`
-    }
-
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: responseText,
-      parse_mode: 'HTML',
-      reply_to_message_id: message.message_id
-    })
-  } catch (error) {
-    console.error('Error checking blocked users:', error)
-    await sendMessage({
-      chat_id: message.chat.id,
-      text: '❌ 查询被屏蔽用户列表时出错。',
-      reply_to_message_id: message.message_id
-    })
-  }
-}
-
-/**
- * 处理更新消息
- */
-async function onUpdate(update) {
-  try {
-    if (update.message) {
-      const message = update.message
-      const user = message.from
-      const chat_id = message.chat.id
-
-      // 处理 /start 命令（支持 /start 和 /start@botname 格式）
-      if (message.text && (message.text === '/start' || message.text.startsWith('/start@'))) {
-        return await handleStart(message)
-      }
-
-      // 处理来自管理员的命令（支持管理群组和私聊，支持 @botname 格式）
-      if (user.id.toString() === ADMIN_UID && (chat_id.toString() === ADMIN_GROUP_ID || message.chat.type === 'private')) {
-        const commandText = message.text?.split('@')[0] || '' // 提取命令部分，去掉 @botname
-        
-        if (commandText === '/clear') {
-          return await handleClearCommand(message)
-        }
-        if (commandText === '/broadcast') {
-          return await handleBroadcastCommand(message)
-        }
-        if (commandText === '/block') {
-          return await handleBlockCommand(message)
-        }
-        if (commandText === '/unblock' || message.text?.startsWith('/unblock ')) {
-          return await handleUnblockCommand(message)
-        }
-        if (commandText === '/checkblock') {
-          return await handleCheckBlockCommand(message)
-        }
-        if (commandText === '/del') {
-          return await handleDeleteCommand(message)
-        }
-        // 如果是其他命令但在私聊中使用，给出提示
-        if (message.chat.type === 'private' && ['/clear', '/del'].includes(message.text)) {
-          await sendMessage({
-            chat_id: chat_id,
-            text: '此命令需要在管理群组的话题内使用。',
-            reply_to_message_id: message.message_id
-          })
-          return
-        }
-      }
-
-      // 处理私聊消息 (用户 -> 管理员)
-      if (message.chat.type === 'private') {
-        return await forwardMessageU2A(message)
-      }
-
-      // 处理管理群组消息 (管理员 -> 用户)
-      if (chat_id.toString() === ADMIN_GROUP_ID) {
-        return await forwardMessageA2U(message)
-      }
-    }
-
-    // 处理编辑消息
-    if (update.edited_message) {
-      const edited_message = update.edited_message
-      const chat_id = edited_message.chat.id
-      
-      if (edited_message.chat.type === 'private') {
-        // 用户编辑消息
-        return await handleEditedMessage(edited_message, true)
-      }
-      
-      if (chat_id.toString() === ADMIN_GROUP_ID) {
-        // 管理员编辑消息
-        return await handleEditedMessage(edited_message, false)
-      }
-    }
-  } catch (error) {
-    console.error('Error processing update:', error)
-  }
-}
-
-/**
- * 处理 Webhook 请求
- */
-async function handleWebhook(event) {
-  // 验证密钥
-  if (event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
-    return new Response('Unauthorized', { status: 403 })
-  }
-
-  // 读取更新
-  const update = await event.request.json()
-  
-  // 异步处理更新
-  event.waitUntil(onUpdate(update))
-
-  return new Response('Ok')
-}
-
-/**
- * 注册 Webhook
- */
-async function registerWebhook(event, requestUrl, suffix, secret) {
-  const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`
-  
-  // 调试信息
-  console.log('🔧 Webhook 注册详情:')
-  console.log('TOKEN:', TOKEN ? `前10位: ${TOKEN.slice(0, 10)}...` : '❌ 未配置')
-  console.log('SECRET:', secret ? '✅ 已配置' : '❌ 未配置')
-  console.log('Webhook URL:', webhookUrl)
-  console.log('API URL:', apiUrl('setWebhook'))
-  
-  // 注册 Webhook
-  const r = await fetch(apiUrl('setWebhook'), {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      url: webhookUrl,
-      secret_token: secret,
-      allowed_updates: ['message', 'edited_message']
-    }),
-  })
-
-  const result = await r.json()
-  console.log('📡 Telegram API 响应:', result)
-  
-  // 注册机器人命令（只注册 /start，其他命令隐藏）
-  try {
-    const commandsResult = await fetch(apiUrl('setMyCommands'), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        commands: [
-          {
-            command: 'start',
-            description: '启动机器人 / Start the bot'
-          }
-        ]
-      }),
-    })
-    const commandsData = await commandsResult.json()
-    console.log('📋 命令注册响应:', commandsData)
-  } catch (error) {
-    console.error('❌ 命令注册失败:', error)
-  }
-  
-  return new Response(JSON.stringify(result, null, 2), {
-    headers: { 'content-type': 'application/json' }
-  })
-}
-
-/**
- * 注销 Webhook
- */
-async function unRegisterWebhook(event) {
-  const r = await fetch(apiUrl('setWebhook'), {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      url: '',
-    }),
-  })
-
-  return new Response('ok' in (await r.json()) ? 'Ok' : 'Error')
-}
-
-/**
- * 初始化数据库表
- */
-async function initDatabase(d1) {
-  const statements = [
-    // 创建表
-    `CREATE TABLE IF NOT EXISTS users (
-      user_id TEXT PRIMARY KEY,
-      first_name TEXT,
-      last_name TEXT,
-      username TEXT,
-      message_thread_id INTEGER,
-      created_at INTEGER,
-      updated_at INTEGER
-    )`,
-    `CREATE TABLE IF NOT EXISTS message_mappings (
-      mapping_key TEXT PRIMARY KEY,
-      mapped_value INTEGER,
-      created_at INTEGER
-    )`,
-    `CREATE TABLE IF NOT EXISTS topic_status (
-      thread_id INTEGER PRIMARY KEY,
-      status TEXT DEFAULT 'opened',
-      updated_at INTEGER
-    )`,
-    `CREATE TABLE IF NOT EXISTS user_states (
-      user_id TEXT NOT NULL,
-      state_key TEXT NOT NULL,
-      state_value TEXT,
-      expiry_time INTEGER,
-      PRIMARY KEY (user_id, state_key)
-    )`,
-    `CREATE TABLE IF NOT EXISTS blocked_users (
-      user_id TEXT PRIMARY KEY,
-      blocked INTEGER DEFAULT 1,
-      blocked_at INTEGER
-    )`,
-    `CREATE TABLE IF NOT EXISTS message_rates (
-      user_id TEXT PRIMARY KEY,
-      last_message_time INTEGER
-    )`,
-    // 创建索引
-    'CREATE INDEX IF NOT EXISTS idx_users_thread ON users(message_thread_id)',
-    'CREATE INDEX IF NOT EXISTS idx_mappings_key ON message_mappings(mapping_key)',
-    'CREATE INDEX IF NOT EXISTS idx_states_expiry ON user_states(expiry_time)'
-  ]
-  
-  try {
-    // 使用 batch 批量执行所有语句
-    const preparedStatements = statements.map(sql => d1.prepare(sql))
-    await d1.batch(preparedStatements)
-    console.log('✅ Database tables initialized successfully')
-  } catch (error) {
-    console.error('❌ Database initialization error:', error)
-    throw error
-  }
-}
-
-/**
- * 主事件监听器 (使用 ES Module 格式)
- */
+// 主入口函数
 export default {
-  async fetch(request, env, ctx) {
-    // 初始化配置变量
-    initConfig(env)
+  async fetch(request, env) {
+    initConfig(env);
+    db = new Database(env.D1);
+
+    const url = new URL(request.url);
     
-    // 初始化数据库连接
-    if (!db && env.D1) {
-      db = new Database(env.D1)
+    // 数据库初始化端点
+    if (url.pathname === '/initDatabase') {
+      return initDatabase(request, env);
     }
     
-    const url = new URL(request.url)
-    
-    if (url.pathname === WEBHOOK) {
-      return await handleWebhook({ request, waitUntil: ctx.waitUntil.bind(ctx) })
-    } else if (url.pathname === '/registerWebhook') {
-      return await registerWebhook({ request }, url, WEBHOOK, SECRET)
-    } else if (url.pathname === '/unRegisterWebhook') {
-      return await unRegisterWebhook({ request })
-    } else if (url.pathname === '/initDatabase') {
-      try {
-        await initDatabase(env.D1)
-        return new Response('✅ Database initialized successfully', { 
-          status: 200,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-        })
-      } catch (error) {
-        return new Response(`❌ Database initialization failed: ${error.message}`, { 
-          status: 500,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-        })
+    // Webhook注册端点
+    if (url.pathname === '/registerWebhook') {
+      return registerWebhook(env);
+    }
+
+    // 处理Telegram回调
+    if (request.method === 'POST' && url.pathname === WEBHOOK) {
+      // 验证secret
+      if (SECRET && request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
+        return new Response('Unauthorized', { status: 403 });
       }
-    } else {
-      return new Response('No handler for this request')
+
+      const update = await request.json();
+      await onUpdate(update, env);
+      return new Response('OK');
     }
+
+    return new Response('Not found', { status: 404 });
   }
-}
+};
